@@ -1451,7 +1451,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale_inv"]
             pass
 
-            if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
+            if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [0,1,2], f"we only support per-tensor (ndim=0), row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
 
             if layer_name in quant_state_dict:
                 # nn.Parameter attributes have no .weight
@@ -1477,8 +1477,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                     layer.weight.input_scale_ub = kwargs['input_scale_ub']
                     layer.quant_method = "fbgemm_fp8"
-                elif fp8_weight_scale.ndim == 2:
-                    # FP8 dynamic quantized. transformers 5.0+ renamed
+                elif fp8_weight_scale.ndim in [0,2]:
+                    # FP8 block quantized or scalar/per-tensor quantized. transformers 5.0+ renamed
                     # bias -> has_bias and removed device.
                     if Version("transformers") < Version("5.0.0"):
                         fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'], device=get_target_device())
