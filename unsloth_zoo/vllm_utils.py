@@ -2039,6 +2039,7 @@ def load_vllm(
     use_bitsandbytes       : bool = True,
     unsloth_vllm_standby   : bool = False,
     is_vision_model        : bool = False,
+    language_model_only    : bool = False,
     return_args            : bool = False, # Just return args
     max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
     fp8_mode               : Optional[str] = None,
@@ -2556,6 +2557,7 @@ def load_vllm(
         # New vLLM versions need to pass this in!
         # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
         enable_sleep_mode      = unsloth_vllm_standby,
+        language_model_only    = language_model_only,
     )
     if is_vision_model:
         # Limit images/videos per prompt to save memory. TODO: make configurable.

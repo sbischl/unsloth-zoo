@@ -1224,6 +1224,16 @@ def test_load_vllm_gemma4_patch_runs_after_bnb_autodetect():
     assert src.index(autodetect_anchor) < src.index(gate_anchor)
 
 
+def test_load_vllm_forwards_language_model_only_to_engine_args():
+    from unsloth_zoo import vllm_utils
+
+    signature = inspect.signature(vllm_utils.load_vllm)
+    assert signature.parameters["language_model_only"].default is False
+
+    src = inspect.getsource(vllm_utils.load_vllm)
+    assert "language_model_only    = language_model_only" in src
+
+
 def test_gemma4_bnb_skip_module_aliases_cover_vllm_text_prefixes():
     from unsloth_zoo import vllm_utils
 
