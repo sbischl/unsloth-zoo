@@ -997,6 +997,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             offsets = [0] + proj.logical_widths # [q, k, v] sizes
             offsets = np.cumsum(offsets)
             scale_suffix = '.weight_scale'
+            if weight_scale.ndim == 0 and qweight.ndim == 2 and qweight.shape[0] != offsets[-1] and qweight.shape[1] == offsets[-1]:
+                qweight = qweight.T
+
             if weight_scale.ndim == 2:
                 if weight_scale.shape[1] > 1:
                     # Block quantized: 2D weight scale. vLLM stores it transposed
