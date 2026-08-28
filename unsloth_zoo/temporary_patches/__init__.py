@@ -24,6 +24,7 @@ from .gemma4 import *
 from .gemma4_float32 import *
 from .gemma4_banded_attention import *
 from .gemma4_flash_sliding import *
+from .muse_glimmer_banded_attention import *
 from .gpt_oss import *
 from .qwen3_moe import *
 from .qwen3_moe_float32 import *
@@ -48,4 +49,8 @@ from .flex_attention_bwd import *
 # The eager-fallback recovery hook unsloth calls when a backward dies inside
 # activation checkpointing. Named rather than star-imported: `utils` also
 # exports names this package has never re-exported.
-from .utils import eager_fallback_state, force_eager_fallback
+from .utils import (
+    eager_fallback_state,
+    force_eager_fallback,
+    apply_pending_eager_fallbacks,
+)

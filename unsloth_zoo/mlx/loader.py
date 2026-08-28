@@ -105,7 +105,7 @@ def _is_force_float32_arch(model_type: str) -> bool:
     (strips ``-``/``_``; trailing comma marks an exact-match entry)."""
     if not model_type:
         return False
-    from ..model_lists import FORCE_FLOAT32
+    from unsloth_zoo.model_lists import FORCE_FLOAT32
     def _norm(s: str) -> str:
         return s.lower().replace("-", "").replace("_", "")
     norm_input = _norm(model_type)
@@ -178,13 +178,15 @@ def _keep_norm_parameters_float32(model) -> None:
     if not needs_cast:
         return
 
-    model.update(tree_map_with_path(
+    casted = tree_map_with_path(
         lambda k, v: v.astype(mx.float32)
         if is_mlx_norm_parameter_path(k) and mx.issubdtype(v.dtype, mx.floating)
         else v,
         parameters,
-    ))
-    mx.eval(model.parameters())
+    )
+    model.update(casted)
+    # Evaluating the whole tree would page every weight into one command buffer.
+    mx.eval([v for k, v in tree_flatten(casted) if is_mlx_norm_parameter_path(k)])
 
 
 def _seed_mlx_random_state(random_state):
@@ -2562,19 +2564,38 @@ _VLM_MODEL_FIXUPS = (
 
 
 def _disable_fused_mrope(model):
-    """Flip fused_apply off so MRoPE training uses the differentiable
-    cos/sin fallback; the fused Metal kernel has no VJP."""
-    count = 0
+    """The fused MRoPE Metal kernel has no VJP; training needs the cos/sin fallback."""
+    changed = []
     try:
         modules = model.modules()
     except Exception:
-        return
+        return changed
     for module in modules:
         if getattr(module, "fused_apply", False):
             module.fused_apply = False
-            count += 1
-    if count:
-        print(f"Unsloth: Disabled fused MRoPE kernel on {count} modules for training (no VJP).")
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused MRoPE kernel on {len(changed)} modules for training (no VJP).")
+    return changed
+
+
+def _disable_fused_input_projections(model):
+    """GLM-5.x linear attention concatenates the raw `.weight` of its six input
+    projections once and caches it: a LoRA wrapper has no `.weight` to read, and a
+    full fine-tune would keep the pre-training copy."""
+    changed = []
+    try:
+        modules = model.modules()
+    except Exception:
+        return changed
+    for module in modules:
+        if getattr(module, "fuse_in", False) and hasattr(module, "_fused_ready"):
+            module.fuse_in = False
+            module._fused_ready = False
+            changed.append(module)
+    if changed:
+        print(f"Unsloth: Disabled fused input projections on {len(changed)} modules.")
+    return changed
 
 
 def _safe_getsource(obj) -> str:
@@ -2608,6 +2629,32 @@ def _get_mlx_lm_model_class(model_type: str):
     return getattr(module, "Model", None)
 
 
+_VLM_TEXT_PATH_MODEL_TYPES = frozenset({
+    "muse_glimmer",
+    # Hybrid linear-attention decoders mlx_lm has no class for. Both reproduce a
+    # fresh model bitwise across a width or batch change, so the position tensor
+    # qwen4_exp caches between calls never leaks into the next text batch.
+    "qwen4_exp",
+    "glm5_next",
+})
+
+
+def _mlx_vlm_text_path_is_verified(model_type: str) -> bool:
+    """Whether mlx-vlm's text path for this architecture is known to train.
+
+    Listed rather than inferred, because nothing readable before loading proves
+    it: mlx-vlm's encoder-decoder and masked-diffusion families declare the same
+    token-logit output as the causal ones, and the Qwen, GLM and Paddle towers
+    holding `_position_ids` across calls declare nothing about it. An unlisted
+    architecture keeps the mlx_lm "Model type ... not supported" it had before.
+    """
+    if not model_type:
+        return False
+    # Shared with utils' vision-grid family set so the two cannot disagree on spelling.
+    from .utils import _mlx_vlm_canonical_model_type
+    return _mlx_vlm_canonical_model_type(model_type) in _VLM_TEXT_PATH_MODEL_TYPES
+
+
 def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     """Whether a multimodal wrapper should stay on the VLM load path.
 
@@ -2615,6 +2662,11 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
     stripping modality towers in `sanitize()`, meaning it reconstructs a
     different object graph than the checkpoint. Keeping the VLM path is more
     robust than a per-family sanitizer workaround.
+
+    Multimodal architectures also land in mlx-vlm before mlx_lm has them, or
+    without mlx_lm ever gaining them. mlx_lm cannot construct those at all, so
+    a text-only request loads the wrapper and trains its text tower rather than
+    failing with "Model type ... not supported".
     """
 
     if not _is_vlm(config):
@@ -2622,7 +2674,7 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
 
     cls = _get_mlx_lm_model_class(model_type)
     if cls is None:
-        return False
+        return _mlx_vlm_text_path_is_verified(model_type)
 
     return _has_multimodal_strip_sanitize(cls)
 
@@ -3296,7 +3348,7 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
     "projector",
     "vision_tower", "vision_model", "vision_encoder", "visual",
     "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
-    "audio_encoder", "audio_projection", "embed_audio",
+    "audio_encoder", "audio_projection", "embed_audio", "sound_encoder", "sound_projection",
 )
 
 _MLX_QUANT_MODE_DEFAULTS = {
@@ -4827,105 +4879,118 @@ def _bnb_module_names():
     ]
 
 
-def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
-    """Dequantize a bitsandbytes (NF4) repo to fp16 and write a clean,
-    non-quantized copy to a temp dir, returning its path.
+def _bitsandbytes_is_stubbed():
+    return getattr(sys.modules.get("bitsandbytes"), "IS_UNSLOTH_STUB", False)
 
-    unsloth_zoo stubs out bitsandbytes on Apple Silicon (stubs/bitsandbytes_stub),
-    so the real wheel is imported here with the stub temporarily lifted and
-    restored afterwards. bnb itself dequantizes the NF4 weights; the caller then
-    re-quantizes via MLX's affine path. Raises if bitsandbytes (or its dequant)
-    is unavailable so the caller can fall back to the clear bnb-unsupported error.
+
+@contextmanager
+def _lifted_bitsandbytes_stub():
+    """Make the real bitsandbytes importable for the duration of the block.
+
+    A no-op when no stub is in the way: evicting the resident real wheel would make the
+    next import re-register its torch operators, which raises.
     """
     global _REAL_BITSANDBYTES_MODULES
-    with _BNB_IMPORT_LOCK:
-        saved_meta = list(sys.meta_path)
-        stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
-        sys.meta_path[:] = [
-            finder for finder in sys.meta_path if type(finder).__name__ != "_BnbFinder"
-        ]
+    if not _bitsandbytes_is_stubbed():
+        yield
+        return
+    stub_modules = {name: sys.modules[name] for name in _bnb_module_names()}
+    # Pull out only the stub's own finders and put those back afterwards. Restoring a
+    # whole sys.meta_path snapshot would drop any finder another thread installed during
+    # the block, which is a multi-GB dequant running for minutes.
+    lifted_finders = [
+        (index, finder) for index, finder in enumerate(sys.meta_path)
+        if type(finder).__name__ == "_BnbFinder"
+    ]
+    for _, finder in lifted_finders:
+        sys.meta_path.remove(finder)
+    for name in _bnb_module_names():
+        del sys.modules[name]
+    # Reuse the already-initialized real bnb if we imported it earlier; only a cold
+    # process re-imports (and re-registers torch ops).
+    sys.modules.update(_REAL_BITSANDBYTES_MODULES)
+    try:
+        yield
+    finally:
+        _REAL_BITSANDBYTES_MODULES = {
+            name: sys.modules[name] for name in _bnb_module_names()
+        }
         for name in _bnb_module_names():
             del sys.modules[name]
-        # Reuse the already-initialized real bnb if we imported it earlier; only a
-        # cold process re-imports (and re-registers torch ops) for the first time.
-        sys.modules.update(_REAL_BITSANDBYTES_MODULES)
+        sys.modules.update(stub_modules)
+        for index, finder in lifted_finders:
+            sys.meta_path.insert(min(index, len(sys.meta_path)), finder)
+
+
+def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
+    """Dequantize a bitsandbytes (NF4) repo to fp16 into a temp dir, returning its path.
+
+    bnb itself dequantizes; the caller then re-quantizes via MLX's affine path. Raises if
+    bitsandbytes (or its dequant) is unavailable so the caller can fall back to the clear
+    bnb-unsupported error.
+    """
+    with _BNB_IMPORT_LOCK, _lifted_bitsandbytes_stub():
+        import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+        # Only text bnb repos reach here; the caller rejects VLM ones (mlx-vlm dequant is
+        # not wired up yet). Pass torch_dtype, not dtype: transformers 4.x raises
+        # TypeError on `dtype`, and 5.x still accepts torch_dtype.
+        model = AutoModelForCausalLM.from_pretrained(
+            source,
+            torch_dtype=torch.float16,
+            device_map={"": device},
+            token=token,
+            trust_remote_code=trust_remote_code,
+        ).dequantize()
+        # The config still carries bnb's quantization_config and _pre_quantization_dtype,
+        # whose torch.dtype is not JSON-serializable and breaks save_pretrained. The
+        # dequantized weights need none of it.
+        def _strip_quant_meta(cfg):
+            if cfg is None:
+                return
+            for _attr in ("quantization_config", "_pre_quantization_dtype"):
+                if hasattr(cfg, _attr):
+                    try:
+                        delattr(cfg, _attr)
+                    except Exception:
+                        pass
+            for _sub in (
+                "vision_config", "text_config", "audio_config",
+                "speech_config", "image_config", "encoder_config",
+                "decoder_config",
+            ):
+                _strip_quant_meta(getattr(cfg, _sub, None))
+        _strip_quant_meta(model.config)
+        tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
         try:
-            import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
-
-            # Only text bnb repos reach here; VLM bnb repos are rejected by the
-            # caller (mlx-vlm dequant is not wired up yet). AutoModelForCausalLM
-            # dequantizes the NF4 weights to fp16. Pass torch_dtype, not dtype:
-            # the supported transformers 4.x range only accepts torch_dtype (a
-            # `dtype` kwarg raises TypeError there), and 5.x still accepts it.
-            model = AutoModelForCausalLM.from_pretrained(
-                source,
-                torch_dtype=torch.float16,
-                device_map={"": device},
-                token=token,
-                trust_remote_code=trust_remote_code,
-            ).dequantize()
-            # After dequantize, the model config still carries bnb's
-            # quantization_config plus _pre_quantization_dtype (a torch.dtype).
-            # The dtype is not JSON-serializable and breaks save_pretrained; the
-            # dequantized weights no longer need any of this metadata.
-            def _strip_quant_meta(cfg):
-                if cfg is None:
-                    return
-                for _attr in ("quantization_config", "_pre_quantization_dtype"):
-                    if hasattr(cfg, _attr):
-                        try:
-                            delattr(cfg, _attr)
-                        except Exception:
-                            pass
-                # Walk known sub-config attrs that models use to nest configs.
-                for _sub in (
-                    "vision_config", "text_config", "audio_config",
-                    "speech_config", "image_config", "encoder_config",
-                    "decoder_config",
-                ):
-                    _strip_quant_meta(getattr(cfg, _sub, None))
-            _strip_quant_meta(model.config)
-            tmpdir = tempfile.mkdtemp(prefix="unsloth_bnb_dequant_")
+            # transformers 5.x: leftover weight-name conversions can't be reversed for
+            # quantized weights, so save_pretrained's revert_weight_conversion raises.
+            # Dequantized weights need none. No-op on 4.x, which lacks the attribute.
             try:
-                # transformers 5.x: the dequantized model still carries
-                # weight-name conversions that can't be reversed for quantized
-                # weights, so save_pretrained's revert_weight_conversion raises.
-                # The dequantized weights need no conversion; clear it. No-op on
-                # 4.x, where the attribute doesn't exist.
-                try:
-                    model._weight_conversions = []
-                except Exception:
-                    pass
-                model.save_pretrained(tmpdir, safe_serialization=True)
-                # Save the tokenizer so the downstream mlx-lm load can read it.
-                AutoTokenizer.from_pretrained(
-                    source, token=token, trust_remote_code=trust_remote_code,
-                ).save_pretrained(tmpdir)
-            except BaseException:
-                # Don't leak the multi-GB fp16 scratch copy: BaseException,
-                # because a Ctrl-C during the long safetensors write is the
-                # likeliest abort and must clean up too.
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                raise
-            # Release the fp16 model and bnb's MPS allocator cache so the caller's
-            # MLX re-quantization (and any later loads) aren't starved of memory.
-            del model
-            gc.collect()
-            if device == "mps":
-                torch.mps.empty_cache()
-            return tmpdir
-        finally:
-            _REAL_BITSANDBYTES_MODULES = {
-                name: sys.modules[name] for name in _bnb_module_names()
-            }
-            for name in _bnb_module_names():
-                del sys.modules[name]
-            sys.modules.update(stub_modules)
-            sys.meta_path[:] = saved_meta
+                model._weight_conversions = []
+            except Exception:
+                pass
+            model.save_pretrained(tmpdir, safe_serialization=True)
+            # Needed by the downstream mlx-lm load.
+            AutoTokenizer.from_pretrained(
+                source, token=token, trust_remote_code=trust_remote_code,
+            ).save_pretrained(tmpdir)
+        except BaseException:
+            # Don't leak the multi-GB fp16 scratch copy. BaseException, because a Ctrl-C
+            # during the long safetensors write is the likeliest abort.
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
+        # Release the fp16 model and bnb's MPS allocator cache so the caller's MLX
+        # re-quantization isn't starved of memory.
+        del model
+        gc.collect()
+        if device == "mps":
+            torch.mps.empty_cache()
+        return tmpdir
 
 
 def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
@@ -5203,6 +5268,55 @@ def _first_media_user_message_index(messages):
     return -1
 
 
+def _qwen3_omni_media_counts(content):
+    """Count top-level media items rendered by Qwen3 Omni's native template."""
+    counts = [0, 0, 0]
+    for item in content if isinstance(content, list) else ():
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type", "")).lower()
+        if kind == "image" or "image" in item or "image_url" in item:
+            index = 0
+        elif kind == "audio" or "audio" in item or "audio_url" in item:
+            index = 1
+        # `video_url` has no "video" key. Grouped here to agree with
+        # `_structured_multimodal_counts`; the template renders it either way.
+        elif kind in ("video", "video_url") or "video" in item or "video_url" in item:
+            index = 2
+        else:
+            index = None
+        if index is not None:
+            counts[index] += 1
+    return tuple(counts)
+
+
+def _normalize_qwen3_omni_counted_message(message, num_images, num_audios, kwargs):
+    """Put Qwen's counted media before text without losing formatter metadata."""
+    if not isinstance(message, dict):
+        return message
+    # A tool call or empty assistant stub carries no content; subscripting
+    # raised KeyError where every neighbouring guard returns the message.
+    content = message.get("content")
+    if content is None:
+        return message
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    elif not isinstance(content, list):
+        return message
+    groups = [[], [], [], []]
+    for item in content:
+        counts = _qwen3_omni_media_counts([item])
+        group = 0 if counts[2] else 1 if counts[0] else 2 if counts[1] else 3
+        groups[group].append(item)
+    counts = _qwen3_omni_media_counts(content)
+    if str(message.get("role", "user")).lower() not in _NON_USER_ROLES:
+        if not kwargs.get("skip_image_token"):
+            groups[1] += [{"type": "image"}] * max(0, num_images - counts[0])
+        if not kwargs.get("skip_audio_token"):
+            groups[2] += [{"type": "audio"}] * max(0, num_audios - counts[1])
+    return {**message, "content": sum(groups, [])}
+
+
 def _anchor_conversation_media_to_first_user_turn(
     prompt_utils_module,
     model_type,
@@ -5229,16 +5343,34 @@ def _anchor_conversation_media_to_first_user_turn(
             message.get("content", "")
         )
         is_target = i == target_idx and role.lower() not in _NON_USER_ROLES
+        message_kwargs = dict(kwargs)
+        skip_image_token = bool(message_kwargs.pop("skip_image_token", False)) or not is_target
+        skip_audio_token = bool(message_kwargs.pop("skip_audio_token", False)) or not is_target
+        message_kwargs.pop("role", None)
+        if not is_target:
+            message_kwargs.pop("video", None)
         rendered = prompt_utils_module.get_message_json(
             model_type,
             content,
             role,
-            skip_image_token=not is_target,
-            skip_audio_token=not is_target,
+            skip_image_token=skip_image_token,
+            skip_audio_token=skip_audio_token,
             num_images=num_images,
             num_audios=num_audios,
-            **kwargs,
+            **message_kwargs,
         )
+        if model_type == "qwen3_omni_moe":
+            options = {
+                **message_kwargs,
+                "skip_image_token": skip_image_token,
+                "skip_audio_token": skip_audio_token,
+            }
+            rendered = _normalize_qwen3_omni_counted_message(
+                rendered,
+                num_images if is_target else 0,
+                num_audios if is_target else 0,
+                options,
+            )
         if isinstance(message, dict):
             if isinstance(rendered, dict):
                 rendered = {**message, **rendered}
@@ -5370,12 +5502,58 @@ def _prepare_vlm_template_messages(
     has_structured_multimodal = _messages_have_structured_multimodal_content(
         normalized_messages
     )
+    if model_type == "qwen3_omni_moe":
+        has_structured_multimodal |= any(
+            any(_qwen3_omni_media_counts(message.get("content", "")))
+            for message in normalized_messages
+        )
     needs_media_anchor = (
         not has_structured_multimodal and (num_images > 0 or num_audios > 0)
     )
 
     template_messages = normalized_messages
-    if needs_media_anchor:
+    # Not gated on the counts: embedded media leaves them at zero, and ordering
+    # is wrong on its own merits. Counts only size the anchor's deficit.
+    if (
+        model_type == "qwen3_omni_moe"
+        and has_structured_multimodal
+        and (
+            target_idx := _first_media_user_message_index(normalized_messages)
+        ) >= 0
+    ):
+        counts = [
+            _qwen3_omni_media_counts(message.get("content", ""))
+            for message in normalized_messages
+        ]
+        missing = (
+            0
+            if kwargs.get("skip_image_token")
+            else max(0, num_images - sum(item[0] for item in counts)),
+            0
+            if kwargs.get("skip_audio_token")
+            else max(0, num_audios - sum(item[1] for item in counts)),
+        )
+        # Every user-like turn, not just the anchor: a later `text, audio` turn
+        # keeps that order otherwise and audio rendered last loses Thinker
+        # conditioning. Only the anchor takes the deficit.
+        rebuilt = list(normalized_messages)
+        changed = False
+        for index, message in enumerate(normalized_messages):
+            if str(message.get("role", "user")).lower() in _NON_USER_ROLES:
+                continue
+            extra = missing if index == target_idx else (0, 0)
+            if not (any(counts[index]) or any(extra)):
+                continue
+            rebuilt[index] = _normalize_qwen3_omni_counted_message(
+                message,
+                counts[index][0] + extra[0],
+                counts[index][1] + extra[1],
+                kwargs,
+            )
+            changed = True
+        if changed:
+            template_messages = rebuilt
+    elif needs_media_anchor:
         template_messages = _anchor_conversation_media_to_first_user_turn(
             prompt_utils_module,
             model_type,
@@ -5400,12 +5578,18 @@ def _render_vlm_template_or_fallback(
     kwargs,
 ):
     """Render a message list, falling back only when the upstream template is empty."""
-    rendered = prompt_utils_module.get_chat_template(
-        processor,
-        messages,
-        add_generation_prompt,
-        **kwargs,
-    )
+    if model_type == "qwen3_omni_moe" and hasattr(processor, "apply_chat_template"):
+        # Omit Qwen Instruct's implicit `enable_thinking=False`; keep explicit overrides.
+        native_kwargs = dict(kwargs)
+        tokenize = native_kwargs.pop("tokenize", False)
+        rendered = processor.apply_chat_template(messages, tokenize=tokenize, add_generation_prompt=add_generation_prompt, **native_kwargs)
+    else:
+        rendered = prompt_utils_module.get_chat_template(
+            processor,
+            messages,
+            add_generation_prompt,
+            **kwargs,
+        )
     if isinstance(rendered, str) and rendered.strip():
         return rendered
 
@@ -5453,6 +5637,44 @@ def _ensure_vlm_prompt_utils_patched():
     ):
         config_data = config if isinstance(config, dict) else config.__dict__
         model_type = config_data["model_type"]
+        model_config = getattr(prompt_utils, "MODEL_CONFIG", {})
+        if isinstance(model_type, str) and model_type not in model_config:
+            folded = model_type.casefold()
+            canonical = next((key for key in model_config if isinstance(key, str) and key.casefold() == folded), None)
+            if canonical is not None:
+                # Published configs may capitalize mlx-vlm's lowercase key.
+                config_data = dict(config_data)
+                config_data["model_type"] = canonical
+                config = config_data
+                model_type = canonical
+
+        if (
+            model_type == "qwen3_omni_moe"
+            and not isinstance(prompt, (dict, list))
+            and num_audios > 0
+        ):
+            # Qwen requires media before text; mlx-vlm renders audio last.
+            message = prompt_utils.get_message_json(
+                model_type,
+                str(prompt),
+                num_images=num_images,
+                num_audios=num_audios,
+                **kwargs,
+            )
+            message = _normalize_qwen3_omni_counted_message(
+                message, num_images, num_audios, kwargs
+            )
+            messages = [message]
+            if return_messages:
+                return messages
+            return _render_vlm_template_or_fallback(
+                prompt_utils,
+                model_type,
+                processor,
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                kwargs=kwargs,
+            )
 
         if not isinstance(prompt, (dict, list)):
             return _original_vlm_apply_chat_template(
@@ -5480,6 +5702,7 @@ def _ensure_vlm_prompt_utils_patched():
             not return_messages
             and not kwargs.get("video")
             and not _prompt_has_tool_metadata(prompt)
+            and model_type != "qwen3_omni_moe"
             and model_type in getattr(prompt_utils, "MODEL_CONFIG", {})
             and _structured_media_matches_count_renderer(
                 normalized_messages, num_images, num_audios
@@ -5593,13 +5816,23 @@ def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
             "repo_id", "commit_message", "commit_description",
             "create_pr", "revision",
         ),
+        context="save_pretrained_merged",
     )
     save_pretrained_merged(self, tokenizer, save_directory, **kwargs)
 
 
-def _mlx_supported_kwargs(kwargs, supported):
-    """Keep CUDA-compatible kwargs out of MLX-only save/export APIs."""
-    return {key: kwargs[key] for key in supported if key in kwargs}
+def _mlx_supported_kwargs(kwargs, supported, context=None):
+    """Keep CUDA-only kwargs out of MLX save/export APIs; `context` names the caller in the
+    warning, since a silently dropped save option misexports."""
+    kept = {key: kwargs[key] for key in supported if key in kwargs}
+    if context is not None:
+        dropped = sorted(set(kwargs) - set(kept))
+        if dropped:
+            warnings.warn(
+                f"Unsloth: {context} ignored unsupported argument(s) "
+                f"{', '.join(dropped)} on the MLX path."
+            )
+    return kept
 
 
 def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
@@ -5613,6 +5846,7 @@ def _mlx_push_to_hub(self, repo_id, *args, **kwargs):
             "token", "private", "tags", "commit_message",
             "commit_description", "create_pr", "revision",
         ),
+        context="push_to_hub",
     )
     if save_directory is not None:
         _mlx_save_pretrained_merged(
@@ -5639,7 +5873,11 @@ def _mlx_save_pretrained_gguf(self, save_directory, tokenizer=None,
                                quantization_method="fast_quantized", **kwargs):
     from .utils import save_pretrained_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion",))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "imatrix_file"),
+        context="save_pretrained_gguf",
+    )
     save_pretrained_gguf(self, tokenizer, save_directory,
                          quantization_method=quantization_method, **kwargs)
 
@@ -5657,7 +5895,11 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                             quantization_method="fast_quantized", **kwargs):
     from .utils import push_to_hub_gguf
     tokenizer = tokenizer or self._tokenizer
-    kwargs = _mlx_supported_kwargs(kwargs, ("first_conversion", "token", "private"))
+    kwargs = _mlx_supported_kwargs(
+        kwargs,
+        ("first_conversion", "token", "private", "imatrix_file"),
+        context="push_to_hub_gguf",
+    )
     push_to_hub_gguf(self, tokenizer, repo_id, repo_id=repo_id,
                      quantization_method=quantization_method, **kwargs)
 
@@ -5827,9 +6069,16 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     from mlx_vlm import stream_generate
     from .utils import _to_mx_vlm_batch
 
-    processor = getattr(self, "_tokenizer", None)
+    # A text-only multimodal load publishes an inner tokenizer that cannot drive
+    # mlx-vlm preprocessing. By presence, so a falsy processor is not replaced by it.
+    processor = getattr(self, "_processor", None)
     if processor is None:
-        raise ValueError("Unsloth MLX: VLM generate() requires model._tokenizer.")
+        processor = getattr(self, "_tokenizer", None)
+    if processor is None:
+        raise ValueError(
+            "Unsloth MLX: VLM generate() requires model._processor or "
+            "model._tokenizer."
+        )
 
     inputs = {}
     if args:
@@ -7999,6 +8248,8 @@ class FastMLXModel:
             _unfreeze_full_modules(_cpt_full_specs)
 
         _apply_mlx_lora_initialization(model, init_lora_weights)
+        # Adapters are invisible to a cached weight fusion.
+        _disable_fused_input_projections(model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):
